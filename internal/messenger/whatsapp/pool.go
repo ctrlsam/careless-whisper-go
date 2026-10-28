@@ -49,11 +49,15 @@ func devicePath(base string, index int) string {
 // PoolConfig configures a multi-account Pool.
 type PoolConfig struct {
 	// Size is the number of accounts to pair. A value below one is treated as
-	// one.
+	// one. Ignored when Paths is set.
 	Size int
 	// BasePath is the session store path; per-account files are suffixed with
-	// the account index.
+	// the account index. Ignored when Paths is set.
 	BasePath string
+	// Paths optionally supplies an explicit session store path per account.
+	// When non-empty it overrides Size and BasePath: one client is built per
+	// entry, in order, so PairPhones still aligns by index.
+	Paths []string
 	// QR receives the account index and a QR code string for each pairing.
 	// Ignored for accounts paired by phone number (see PairPhones).
 	QR func(account int, code string)
@@ -70,6 +74,9 @@ type PoolConfig struct {
 	// PairTimeout bounds how long to wait for each account to connect, allowing
 	// for a manual QR scan. Zero uses the adapter default.
 	PairTimeout time.Duration
+	// RequirePaired makes each account refuse to drive pairing and fail when its
+	// session is not already linked. Used by run commands.
+	RequirePaired bool
 	// Logger is the whatsmeow logger shared by every client.
 	Logger waLog.Logger
 }
@@ -77,7 +84,9 @@ type PoolConfig struct {
 // NewPool builds a Pool from cfg.
 func NewPool(cfg PoolConfig) *Pool {
 	size := cfg.Size
-	if size < 1 {
+	if len(cfg.Paths) > 0 {
+		size = len(cfg.Paths)
+	} else if size < 1 {
 		size = 1
 	}
 	logger := cfg.Logger
@@ -90,8 +99,12 @@ func NewPool(cfg PoolConfig) *Pool {
 	}
 	for i := 0; i < size; i++ {
 		index := i
+		path := devicePath(cfg.BasePath, index)
+		if len(cfg.Paths) > 0 {
+			path = cfg.Paths[index]
+		}
 		opts := []Option{
-			WithSessionPath(devicePath(cfg.BasePath, index)),
+			WithSessionPath(path),
 			WithLogger(logger),
 		}
 		if cfg.QR != nil {
@@ -108,6 +121,9 @@ func NewPool(cfg PoolConfig) *Pool {
 		}
 		if cfg.PairTimeout > 0 {
 			opts = append(opts, WithConnectTimeout(cfg.PairTimeout))
+		}
+		if cfg.RequirePaired {
+			opts = append(opts, WithRequirePaired())
 		}
 		p.clients = append(p.clients, New(opts...))
 	}

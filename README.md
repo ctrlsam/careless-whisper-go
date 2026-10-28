@@ -9,8 +9,7 @@ silent-reaction denial-of-service flood described in the research.
 > RESEARCH USE ONLY. The live `fingerprint` and `dos` commands send real
 > messages to a real phone number. Only run them against devices and phone
 > numbers you own or are explicitly authorised to test. Unauthorised use may be
-> illegal. Both live commands refuse to run until you pass `--i-own-the-target`
-> to confirm ownership or authorisation.
+> illegal.
 
 This tool exists to reproduce and demonstrate published research. It is not a
 product and ships no guarantees. The attack abuses the fact that delivery
@@ -30,6 +29,12 @@ make test
 
 Go 1.26 or later is required. Offline analysis uses only the standard library.
 The live adapter depends on `go.mau.fi/whatsmeow` and a pure-Go SQLite driver.
+
+Every command prints its flags with `--help`:
+
+```sh
+go run ./cmd/careless-whisper fingerprint --help
+```
 
 ## Analyse an existing capture (offline)
 
@@ -51,6 +56,38 @@ Input format is inferred from the extension. Override it with
 `--format jsonl` or `--format csv`. Prometheus text output is available with
 `--output prometheus --phone-number '<target>'`.
 
+## Pair a research account
+
+Live commands need a linked WhatsApp "companion" session. Pair one once with the
+`pair` command and reuse it across runs:
+
+```sh
+go run ./cmd/careless-whisper pair --account '<research-account-number>'
+```
+
+Scan the QR from that account under WhatsApp -> Linked devices. On success the
+session is saved as `<number>.db` in the session directory (default
+`~/.careless-whisper`; override with `--session-dir` or the
+`CARELESS_WHISPER_HOME` environment variable) and the command exits cleanly,
+checkpointing the store.
+
+Session files are named by the number they are bound to, so
+`ls ~/.careless-whisper` shows which accounts are linked. Re-run `pair` any time
+to confirm a session is still good - a valid one reconnects with no QR and
+reports the bound number; an unlinked one fails fast and tells you to re-pair.
+`--repair` discards the stored session and links fresh.
+
+Link by phone-number code instead of QR with
+`--pair-phone '<research-account-number>'`: the command prints an 8-character
+code to enter on that phone under Linked devices -> Link a device -> Link with
+phone number instead. Code pairing uses the same device-linking backend as QR,
+so an account WhatsApp is refusing to link ("Can't link new devices right now")
+is refused either way; it is a different on-phone flow, not a throttle bypass.
+
+A session persists across runs on its own: keep the research phone linked (do
+not sign out or unlink), powered on within WhatsApp's ~14-day linked-device
+window, and do not delete the file.
+
 ## Fingerprint a device you own (live)
 
 The `fingerprint` command sends a continuous stream of silent probe messages to
@@ -59,31 +96,37 @@ the target and infers phone/app/online state from receipt timing.
 ```sh
 go run ./cmd/careless-whisper fingerprint \
   --phone-number '<your-test-number>' \
-  --i-own-the-target \
   --concurrent 5 \
   --delay 1s \
   --exporter jsonl \
   --metrics
 ```
 
-On first run the adapter prints a QR code; scan it from WhatsApp under Linked
-devices to pair the research account. The code is refreshed automatically until
-it is scanned, and the adapter keeps generating fresh codes for the whole
-`--pair-timeout` window (default 5m) rather than giving up after one batch, so
-there is time to scan several lab phones in turn. The session is cached in
-`careless-whisper.db` (override with `--session-path`). With `--metrics` the
-latest analysis is exposed as Prometheus text at `http://localhost:8000/metrics`
-(`--metrics-port` to change). Press Ctrl+C to stop.
+The research session is resolved from the session directory: with a single
+paired session it is used automatically, otherwise pass `--account '<number>'`
+to pick one (or `--session-path` for an explicit file). The session must already
+be linked with `pair` (see above); run commands never pair, so a missing or
+unlinked session fails fast rather than dropping into a QR prompt. A healthy
+session connects quickly; `--connect-timeout` (default 30s) bounds the wait.
+With `--metrics` the latest analysis is exposed as Prometheus text at
+`http://localhost:8000/metrics` (`--metrics-port` to change). Press Ctrl+C to
+stop.
 
-Instead of a QR scan you can link by phone number. Pass `--pair-phone
-'<account-number>'` (the research account's own number) and the adapter prints
-an 8-character code; on that phone open Linked devices -> Link a device -> Link
-with phone number instead, and enter the code. This is the same device-linking
-backend as QR, so an account that WhatsApp is temporarily refusing to link
-("Can't link new devices right now") can still be refused this way; it is a
-different on-phone flow, not a throttle bypass. The code is tied to the same
-login socket as the QR batch, so it is refreshed on the same `--pair-timeout`
-window.
+Each analysis line reports phone/app/online state, the mean RTT, jitter, and a
+best-effort access-network guess (`net`). The Wi-Fi/cellular guess follows the
+paper's jitter and baseline-step signal, is only set when the app is foreground
+and online (a backgrounded app's RTT is push-wake latency, not the radio), and
+marks a likely handover with a trailing `*`. Treat the static Wi-Fi/cellular
+label as qualitative, not measured.
+
+### Probe primitive
+
+`--probe-kind` selects the silent probe (default `revoke`). `revoke` and
+`empty-reaction` both reference a phantom message with nothing to show, so they
+elicit a delivery receipt without rendering anything on the target. `reaction`
+reacts to a phantom message with an emoji, which makes the target display a
+"Waiting for this message" placeholder per probe - so it is NOT silent and is
+kept only for A/B comparison. All kinds produce the same receipt-timing signal.
 
 Exporters write under `--export-dir` (default `exports/`): `jsonl` writes RTT
 reports, receipt batches, outgoing message metadata, and analysis snapshots;
@@ -109,14 +152,25 @@ per message.
 ```sh
 go run ./cmd/careless-whisper dos \
   --phone-number '<your-test-number>' \
-  --i-own-the-target \
   --concurrent 20 \
   --duration 60s
 ```
 
 Stop conditions: `--duration`, `--max-messages`, or Ctrl+C. Tune throughput with
-`--concurrent`, `--delay`, and `--payload-size`. Progress (sent, failed, rate,
-estimated data forced onto the target) is logged every `--report-interval`.
+`--concurrent`, `--delay`, and `--payload-size`. Progress is logged every
+`--report-interval`.
+
+The reported data figure is `sent x payload-size` - an upper bound, not a
+measurement. It overstates the real figure by whatever share of sends the
+server rejected or never delivered. Two things make the gap large: a payload
+much over WhatsApp's accepted message size (roughly 64 KiB) is rejected
+server-side and never reaches the target, and `--no-ack` counts a message as
+sent the moment it is written to the socket, so server rejections are not even
+counted as failures. The tool warns when `--payload-size` is likely to be
+rejected, and labels the figure "unconfirmed" under `--no-ack`. For a figure
+that tracks what the target actually received, run without `--no-ack` (so
+rejected sends count as failures) and keep `--payload-size` within the accepted
+range, then confirm against the device's own data counter.
 
 Per-client throughput is bounded by the WhatsApp send lock, which is held until
 the server acks each message. `--no-ack` returns as soon as the message is
@@ -125,24 +179,25 @@ per-message send confirmation. Delivery receipts are unaffected.
 
 The send lock is per client, and a single client's Signal session to the target
 cannot be used concurrently, so `--concurrent` alone cannot push past one
-in-flight send. `--accounts N` pairs N separate WhatsApp accounts (a distinct
-phone number each) and fans sends across them, each with its own identity,
-session, socket, and lock, for up to Nx on the lock-bound path. Separate
-accounts avoid the own-device sync fan-out of linking many devices to one
-account. You scan one QR per account at startup - use a different number for
-each - and per-account session files are suffixed `-0`, `-1`, and so on. Each
-account gets its own `--pair-timeout` window to scan, so there is time to pair
-the lab phones one by one. To link accounts by phone number instead of QR, pass
-`--pair-phones '<num0>,<num1>'` (one entry per account in order; leave an entry
-empty to keep that account on QR). This scales message rate, not data volume: a
-payload large enough to saturate the uplink stays uplink-bound because all
-accounts share one uplink.
+in-flight send. Fanning across several accounts - each with its own identity,
+session, socket, and lock - gives up to Nx on the lock-bound path, and avoids
+the own-device sync fan-out of linking many devices to one account. Pair each
+account first with `pair` (one per number), then select them with
+`--account '<num0>,<num1>'`; each resolves to its `<number>.db` in the session
+directory. With neither `--account` nor `--session-path`, a single paired
+session in the directory is used automatically; if several are paired the
+command stops and asks you to name them with `--account`, so it never floods
+from more accounts than you intended. `--session-path` selects one explicit
+session file. As with `fingerprint`, every account must already be linked with
+`pair` - `dos` does not pair - and `--connect-timeout` (default 30s) bounds the
+per-account connect wait. This scales message rate, not data volume: a payload
+large enough to saturate the uplink stays uplink-bound because all accounts
+share one uplink.
 
 ```sh
 go run ./cmd/careless-whisper dos \
   --phone-number '<your-test-number>' \
-  --i-own-the-target \
-  --accounts 2 \
+  --account '<num0>,<num1>' \
   --concurrent 20 \
   --no-ack \
   --payload-size 4096
@@ -151,7 +206,7 @@ go run ./cmd/careless-whisper dos \
 ## Packages
 
 - `internal/input` - Python-compatible JSONL and CSV capture ingestion.
-- `internal/analyzer` - RTT, receipt structure, OS, companion, and impact analysis.
+- `internal/analyzer` - RTT, receipt structure, OS, companion, access-network, and impact analysis.
 - `internal/collector` - concurrency-safe send/receipt correlation.
 - `internal/messenger` - authorised adapter interface and registration gate.
 - `internal/messenger/whatsapp` - live whatsmeow WhatsApp adapter.

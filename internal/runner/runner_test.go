@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -121,6 +122,32 @@ func TestRunRefusesUnregisteredTarget(t *testing.T) {
 	err := Run(context.Background(), m, Settings{PhoneNumber: "123"}, nil, nil)
 	if err == nil {
 		t.Fatal("expected refusal for an unregistered target")
+	}
+}
+
+// sessionLostMessenger is registered but every probe reports a lost session.
+type sessionLostMessenger struct{ deliveringMessenger }
+
+func (s *sessionLostMessenger) SendSilentMessage(context.Context, string, string, messenger.SendOptions) (string, error) {
+	return "", messenger.ErrSessionLost
+}
+
+func TestRunStopsOnSessionLost(t *testing.T) {
+	m := &sessionLostMessenger{deliveringMessenger{registered: true}}
+	done := make(chan error, 1)
+	go func() {
+		// No timeout: only a fatal stop can end this run.
+		done <- Run(context.Background(), m, Settings{
+			PhoneNumber: "123", ConcurrentWorkers: 4, DelayBetween: time.Millisecond,
+		}, nil, nil)
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, messenger.ErrSessionLost) {
+			t.Fatalf("expected ErrSessionLost, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after the session was lost (hot-spin?)")
 	}
 }
 

@@ -9,6 +9,8 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -18,6 +20,10 @@ import (
 	"github.com/ctrlsam/careless-whisper-go/internal/messenger"
 	"github.com/ctrlsam/careless-whisper-go/internal/model"
 )
+
+// errorBackoff is the pause after a non-fatal probe error, so a persistent
+// failure backs off instead of hot-spinning the worker.
+const errorBackoff = 250 * time.Millisecond
 
 // Settings configures a fingerprint run.
 type Settings struct {
@@ -69,6 +75,21 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, exp expo
 	if observer != nil {
 		warn = observer.Warn
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// A lost session (logout/unlink) is fatal: capture it once, stop every
+	// worker, and surface it so the fingerprint ends cleanly rather than
+	// spinning on a dead session.
+	var fatalOnce sync.Once
+	var fatalErr error
+	setFatal := func(err error) {
+		fatalOnce.Do(func() {
+			fatalErr = fmt.Errorf("fingerprint stopped: %w", err)
+			cancel()
+		})
+	}
+
 	if err := messenger.ConfirmNumber(ctx, m, settings.PhoneNumber, settings.IgnoreUnregistered, warn); err != nil {
 		return err
 	}
@@ -124,21 +145,35 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, exp expo
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
-		for ctx.Err() == nil {
+		for runCtx.Err() == nil {
 			sentAt := time.Now()
-			msgID, err := m.SendSilentMessage(ctx, settings.PhoneNumber, "", messenger.SendOptions{ProbeKind: settings.ProbeKind})
+			msgID, err := m.SendSilentMessage(runCtx, settings.PhoneNumber, "", messenger.SendOptions{ProbeKind: settings.ProbeKind})
 			if err != nil {
-				if ctx.Err() != nil {
+				if runCtx.Err() != nil {
+					return
+				}
+				if errors.Is(err, messenger.ErrSessionLost) {
+					if observer != nil {
+						observer.Warn("account unlinked by the server; stopping - re-pair with `pair`")
+					}
+					setFatal(err)
 					return
 				}
 				if observer != nil {
 					observer.Warn("silent probe failed: " + err.Error())
 				}
+				// Non-fatal error: back off so a persistent failure does not
+				// hot-spin the worker.
+				select {
+				case <-runCtx.Done():
+					return
+				case <-time.After(errorBackoff):
+				}
 				continue
 			}
 			handleReport(tracker.TrackMessage(msgID, sentAt))
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			case <-time.After(settings.DelayBetween):
 			}
@@ -150,5 +185,8 @@ func Run(ctx context.Context, m messenger.Messenger, settings Settings, exp expo
 		go worker()
 	}
 	wg.Wait()
+	if fatalErr != nil {
+		return fatalErr
+	}
 	return ctx.Err()
 }

@@ -50,6 +50,7 @@ type Messenger struct {
 	pairCode       func(code string)
 	status         func(message string)
 	connectTimeout time.Duration
+	requirePaired  bool
 
 	mu            sync.RWMutex
 	container     *sqlstore.Container
@@ -61,7 +62,20 @@ type Messenger struct {
 
 	ready chan struct{}
 	once  sync.Once
+
+	// loggedOut is closed once when the server unlinks this device. It lets
+	// WaitUntilReady fail fast with ErrLoggedOut instead of blocking until the
+	// connect timeout.
+	loggedOut  chan struct{}
+	loggedOnce sync.Once
+	// pairedThisSession records whether a PairSuccess arrived during this run,
+	// so callers can tell a fresh link from a reused one.
+	pairedThisSession bool
 }
+
+// ErrLoggedOut is returned by WaitUntilReady when the server unlinks the device
+// during the wait. The saved session is no longer valid and must be re-paired.
+var ErrLoggedOut = errors.New("device was logged out by the server; re-pair required")
 
 // Option configures a Messenger.
 type Option func(*Messenger)
@@ -100,6 +114,14 @@ func WithStatusHandler(handler func(message string)) Option {
 	return func(m *Messenger) { m.status = handler }
 }
 
+// WithRequirePaired makes Start refuse to drive interactive pairing: if the
+// session store has no linked device, Start returns an error instead of
+// launching QR/phone-code login. Run commands use this so they only ever
+// operate against a session already linked with the `pair` command.
+func WithRequirePaired() Option {
+	return func(m *Messenger) { m.requirePaired = true }
+}
+
 // WithConnectTimeout overrides how long WaitUntilReady waits for the first
 // authenticated connection.
 func WithConnectTimeout(d time.Duration) Option {
@@ -123,6 +145,7 @@ func New(opts ...Option) *Messenger {
 		log:            waLog.Noop,
 		connectTimeout: defaultConnectTimeout,
 		ready:          make(chan struct{}),
+		loggedOut:      make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -176,6 +199,9 @@ func (m *Messenger) Start(ctx context.Context) error {
 	m.mu.Unlock()
 
 	if client.Store.ID == nil {
+		if m.requirePaired {
+			return fmt.Errorf("no linked session at %s; run `careless-whisper pair --account <number>` first", m.sessionPath)
+		}
 		go m.runQRLogin(ctx, client)
 		return nil
 	}
@@ -305,8 +331,50 @@ func (m *Messenger) WaitUntilReady(ctx context.Context) error {
 	select {
 	case <-m.ready:
 		return nil
+	case <-m.loggedOut:
+		return ErrLoggedOut
 	case <-waitCtx.Done():
 		return fmt.Errorf("timed out waiting for WhatsApp connection: %w", waitCtx.Err())
+	}
+}
+
+// DeviceJID returns the linked device's JID and whether the store currently
+// holds a paired device. It is safe to call after Start.
+func (m *Messenger) DeviceJID() (string, bool) {
+	client := m.snapshotClient()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		return "", false
+	}
+	return client.Store.ID.String(), true
+}
+
+// DeviceUser returns the bound account's phone number (the JID user part) and
+// whether a device is paired. It is used to confirm a session file is named
+// after the number it is actually linked to.
+func (m *Messenger) DeviceUser() (string, bool) {
+	client := m.snapshotClient()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		return "", false
+	}
+	return client.Store.ID.User, true
+}
+
+// PairedThisSession reports whether a fresh pairing completed during this run,
+// as opposed to reusing a session already saved in the store.
+func (m *Messenger) PairedThisSession() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pairedThisSession
+}
+
+// isLoggedOut reports whether the server has unlinked this device during the
+// session, which makes every further send fail.
+func (m *Messenger) isLoggedOut() bool {
+	select {
+	case <-m.loggedOut:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -340,6 +408,9 @@ func (m *Messenger) SendSilentMessage(ctx context.Context, phoneNumber, reaction
 	client := m.snapshotClient()
 	if client == nil {
 		return "", errors.New("WhatsApp client is not connected")
+	}
+	if m.isLoggedOut() {
+		return "", messenger.ErrSessionLost
 	}
 	normalized, err := normalizePhoneNumber(phoneNumber)
 	if err != nil {
@@ -375,6 +446,9 @@ func (m *Messenger) SendSilentMessage(ctx context.Context, phoneNumber, reaction
 		// the expected, successful outcome.
 		if opts.NoAck && errors.Is(err, whatsmeow.ErrMessageTimedOut) {
 			return string(resp.ID), nil
+		}
+		if errors.Is(err, whatsmeow.ErrNotLoggedIn) {
+			return "", fmt.Errorf("%w: %v", messenger.ErrSessionLost, err)
 		}
 		return "", fmt.Errorf("send silent message: %w", err)
 	}
@@ -434,9 +508,13 @@ func (m *Messenger) handleEvent(evt any) {
 	case *events.Connected:
 		m.signalReady()
 	case *events.PairSuccess:
+		m.mu.Lock()
+		m.pairedThisSession = true
+		m.mu.Unlock()
 		m.notify(fmt.Sprintf("paired as %s; establishing authenticated connection", event.ID.User))
 	case *events.LoggedOut:
 		m.notify("logged out by the server; re-pair this account")
+		m.loggedOnce.Do(func() { close(m.loggedOut) })
 	case *events.Receipt:
 		m.handleReceipt(event)
 	case *events.Message:

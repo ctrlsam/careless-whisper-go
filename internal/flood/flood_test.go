@@ -3,6 +3,7 @@ package flood
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 type fakeMessenger struct {
 	sent         int64
 	failUntil    int64
+	sessionLost  bool
 	registered   bool
 	known        bool
 	lastReaction atomic.Value
@@ -23,6 +25,9 @@ func (f *fakeMessenger) Start(context.Context) error          { return nil }
 func (f *fakeMessenger) WaitUntilReady(context.Context) error { return nil }
 
 func (f *fakeMessenger) SendSilentMessage(_ context.Context, _, reaction string, opts messenger.SendOptions) (string, error) {
+	if f.sessionLost {
+		return "", messenger.ErrSessionLost
+	}
 	n := atomic.AddInt64(&f.sent, 1)
 	if n <= f.failUntil {
 		return "", errors.New("transient failure")
@@ -148,5 +153,87 @@ func TestEstimatedGiB(t *testing.T) {
 	stats := Stats{Sent: 1024}
 	if got := stats.EstimatedGiB(1 << 20); got != 1 {
 		t.Fatalf("expected 1 GiB estimate, got %v", got)
+	}
+}
+
+func TestBuildPayloadIsNotConstant(t *testing.T) {
+	got, err := BuildPayload(4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	distinct := map[byte]struct{}{}
+	for i := 0; i < len(got); i++ {
+		distinct[got[i]] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("payload is not random: only %d distinct bytes", len(distinct))
+	}
+}
+
+func TestStatsAckedReflectsNoAck(t *testing.T) {
+	for _, noAck := range []bool{false, true} {
+		m := &fakeMessenger{registered: true, known: true}
+		stats, err := Run(context.Background(), m, Settings{
+			PhoneNumber: "123", ConcurrentWorkers: 1, MaxMessages: 1, PayloadSize: 8, NoAck: noAck,
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Acked == noAck {
+			t.Fatalf("NoAck=%v: expected Acked=%v, got %v", noAck, !noAck, stats.Acked)
+		}
+	}
+}
+
+func TestRunStopsOnSessionLost(t *testing.T) {
+	m := &fakeMessenger{registered: true, known: true, sessionLost: true}
+	done := make(chan struct{})
+	var stats Stats
+	var err error
+	go func() {
+		// No MaxMessages or Duration: only a fatal stop can end this run.
+		stats, err = Run(context.Background(), m, Settings{
+			PhoneNumber: "123", ConcurrentWorkers: 4, PayloadSize: 8,
+		}, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after the session was lost (hot-spin?)")
+	}
+	if !errors.Is(err, messenger.ErrSessionLost) {
+		t.Fatalf("expected ErrSessionLost, got %v", err)
+	}
+	// Each worker hits the fatal error at most once before stopping, so the
+	// failure count stays bounded rather than spinning into the millions.
+	if stats.Failed > 4 {
+		t.Fatalf("expected a bounded failure count, got %d", stats.Failed)
+	}
+}
+
+type captureReporter struct{ warnings []string }
+
+func (c *captureReporter) Progress(Stats, int) {}
+func (c *captureReporter) Warn(m string)       { c.warnings = append(c.warnings, m) }
+func (c *captureReporter) Info(string)         {}
+
+func TestRunWarnsOnOversizedPayload(t *testing.T) {
+	m := &fakeMessenger{registered: true, known: true}
+	r := &captureReporter{}
+	if _, err := Run(context.Background(), m, Settings{
+		PhoneNumber: "123", ConcurrentWorkers: 1, MaxMessages: 1,
+		PayloadSize: likelyRejectedPayloadBytes + 1,
+	}, r); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, w := range r.warnings {
+		if strings.Contains(w, "oversized reactions") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an oversized-payload warning, got %v", r.warnings)
 	}
 }

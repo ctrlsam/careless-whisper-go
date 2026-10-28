@@ -34,6 +34,8 @@ func run(args []string, stdout io.Writer) error {
 	switch args[0] {
 	case "analyze":
 		return analyzeCommand(args[1:], stdout)
+	case "pair":
+		return pairCommand(args[1:], stdout)
 	case "fingerprint":
 		return fingerprintCommand(args[1:], stdout)
 	case "dos":
@@ -49,16 +51,33 @@ func run(args []string, stdout io.Writer) error {
 	}
 }
 
+// handleHelp parses args, and on -h/--help prints the command's flag list to
+// stdout and reports handled=true so the caller can return cleanly. A genuine
+// parse error is returned as-is.
+func handleHelp(flags *flag.FlagSet, args []string, stdout io.Writer, summary string) (handled bool, err error) {
+	flags.SetOutput(io.Discard)
+	switch err := flags.Parse(args); {
+	case errors.Is(err, flag.ErrHelp):
+		fmt.Fprintf(stdout, "careless-whisper %s - %s\n\nUsage: careless-whisper %s [flags]\n\nFlags:\n", flags.Name(), summary, flags.Name())
+		flags.SetOutput(stdout)
+		flags.PrintDefaults()
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		return false, nil
+	}
+}
+
 func analyzeCommand(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("analyze", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
 	inputPath := flags.String("input", "", "capture file in JSONL or CSV format")
 	format := flags.String("format", "auto", "input format: auto, jsonl, or csv")
 	pingInterval := flags.Duration("ping-interval", 2*time.Second, "probe interval represented by the capture")
 	outputFormat := flags.String("output", "json", "output format: json or prometheus")
 	phoneNumber := flags.String("phone-number", "", "target label for Prometheus output")
 	compact := flags.Bool("compact", false, "emit compact JSON")
-	if err := flags.Parse(args); err != nil {
+	if handled, err := handleHelp(flags, args, stdout, "Analyse a JSONL or CSV capture offline"); err != nil || handled {
 		return err
 	}
 	if *inputPath == "" {
@@ -84,8 +103,10 @@ func printUsage(writer io.Writer) {
 		"name":        "careless-whisper",
 		"description": "Delivery-receipt timing research toolkit (RESEARCH USE ONLY)",
 		"disclaimer":  disclaimerText,
+		"help":        "Run `careless-whisper <command> --help` for a command's flags",
 		"commands": map[string]string{
 			"analyze":     "Analyse a Python-compatible JSONL or CSV capture (offline)",
+			"pair":        "Link or validate a reusable session at --session-path and exit",
 			"fingerprint": "Live receipt-timing fingerprint against an authorised target",
 			"dos":         "Silent-reaction denial-of-service flood against an authorised target",
 			"version":     "Print the version",

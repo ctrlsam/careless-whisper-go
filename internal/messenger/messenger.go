@@ -99,6 +99,13 @@ type Messenger interface {
 // registered and the caller did not opt to ignore the warning.
 var ErrUnregistered = errors.New("phone number is not registered on the platform")
 
+// ErrSessionLost is returned by a send when the adapter's session is no longer
+// usable - the account has been logged out or unlinked by the server. It is a
+// fatal, non-retryable condition: the caller should stop rather than retry,
+// because every further send will fail the same way. Adapters wrap it so
+// callers can detect it with errors.Is.
+var ErrSessionLost = errors.New("messenger session lost; the account must be re-paired")
+
 // ConfirmNumber verifies the target is registered before any messages are
 // sent. When registration cannot be determined it logs through warn and
 // proceeds. When the number is unregistered it returns ErrUnregistered unless
